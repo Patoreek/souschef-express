@@ -3,6 +3,7 @@ import cors from "cors";
 import bodyParser from "body-parser";
 import { OpenAI } from "openai"; // Correct import syntax for OpenAI
 import dotenv from "dotenv";
+import pool from "./db.js"; // Import the pool from db.js
 
 dotenv.config();
 
@@ -24,6 +25,9 @@ const emulateChatbotMdResponse = (response) => {
     
     ---
     
+    **Cuisine:** Chinese  
+    **Dish Name:** Chicken Tomato Stir-Fry  
+
     **Markdown File Output:**  
     \`\`\`markdown
     # Chicken Tomato Stir-Fry  
@@ -57,27 +61,89 @@ const emulateChatbotMdResponse = (response) => {
 };
 
 const separateGPTResponse = (response) => {
-  console.log(response);
-  // Split the response at "**Markdown File Output**"
+  // Extract the cuisine
+  const cuisineMatch = response.match(/\*\*Cuisine:\*\* (.+?)(?=\s{2,}|\n|$)/);
+  const cuisine = cuisineMatch ? cuisineMatch[1].trim() : "";
+
+  // Extract the dish name
+  const dishNameMatch = response.match(
+    /\*\*Dish Name:\*\* (.+?)(?=\s{2,}|\n|$)/
+  );
+  const dishName = dishNameMatch ? dishNameMatch[1].trim() : "";
+
+  // Split response at "**Markdown File Output**"
   const separator = "**Markdown File Output:**";
   const parts = response.split(separator);
 
-  // Trim and store the message (top text)
-  const message = parts[0]?.trim() || "";
+  // Trim and clean the message (top text)
+  let message = parts[0]?.trim() || "";
+
+  // Remove "---", "Dish Name", and "Cuisine" lines from the message
+  message = message
+    .replace(/---/, "") // Remove "---"
+    .replace(/\*\*Cuisine:\*\*.*(\n|\s{2,})?/, "") // Remove the Cuisine line and trailing spaces/newlines
+    .replace(/\*\*Dish Name:\*\*.*(\n|\s{2,})?/, "") // Remove the Dish Name line and trailing spaces/newlines
+    .replace(/\n{2,}/g, "\n") // Remove excess blank lines
+    .trim(); // Final cleanup
 
   // Trim and store the Markdown content without the separator
   const markdown = parts[1]?.trim() || "";
 
-  return { message, markdown };
+  return { cuisine, dishName, message, markdown };
 };
 
 // Routes
 app.post("/ask-chef", async (req, res) => {
+  //** USER PROMPT **/
   const userPrompt = req.body;
-  //   console.log(userPrompt);
   if (!userPrompt) {
     return res.status(400).json({ error: "Prompt is required!" });
   }
+  console.log(userPrompt);
+  const userChatStored = await storeChatLog(userPrompt, userPrompt.role);
+  if (!userChatStored)
+    res
+      .status(500)
+      .json({ error: "Failed to store the users prompt in the database." });
+
+  //** GPT RESPONSE **/
+  //   const { message, markdown } = emulateChatbotMdResponse(userPrompt.content);
+  const gptResponse = emulateChatbotMdResponse();
+  const { cuisine, dishName, message, markdown } =
+    separateGPTResponse(gptResponse);
+
+  const cuisineData = await createOrGetCuisine(cuisine);
+  const recipeData = await createOrUpdateRecipe(
+    userPrompt,
+    cuisineData,
+    dishName,
+    markdown
+  );
+
+  const gptChatLog = {
+    role: "system",
+    content: message,
+    dishName: dishName,
+    cuisine: cuisineData.id,
+    recipe: recipeData.id,
+    conversation_id: userPrompt.conversation_id,
+    user_id: 1,
+    message_type: "text",
+  };
+  const gptChatStored = await storeChatLog(gptChatLog, gptChatLog.role);
+
+  if (!gptChatStored)
+    res
+      .status(500)
+      .json({ error: "Failed to store the GPT prompt in the database." });
+
+  console.log("userChatStored:", userChatStored);
+  console.log("gptChatStored:", gptChatStored);
+
+  res.status(200).json({
+    userPrompt: userChatStored,
+    gptChat: gptChatStored,
+  });
 
   //   try {
   //     const stream = await openai.chat.completions.create({
@@ -103,28 +169,124 @@ app.post("/ask-chef", async (req, res) => {
   //     console.error("Error interacting with OpenAI:", error.message);
   //     res.status(500).json({ error: "Failed to process the request." });
   //   }
-
-  //   const { message, markdown } = emulateChatbotMdResponse(userPrompt.content);
-  const gptResponse = emulateChatbotMdResponse();
-  const { message, markdown } = separateGPTResponse(gptResponse);
-
-  const chatLog = {
-    id: "msg-12345",
-    role: "system",
-    content: message,
-    markdown: markdown,
-    created_at: Date.now(),
-    conversation_id: "conv-67890",
-    user_id: "user-abc123",
-    session_id: "session-def456",
-    message_type: "text",
-    // status: "pending",
-  };
-
-  res.status(200).json({
-    response: chatLog,
-  });
 });
+
+app.post("/create-conversation", async (req, res) => {
+  console.log("creating new conversation in db...");
+  const userId = 1; // For now, we'll set user_id to 1
+
+  try {
+    const result = await pool.query(
+      "INSERT INTO conversations (user_id) VALUES ($1) RETURNING *",
+      [userId]
+    );
+
+    res.status(201).json({
+      message: "Conversation created successfully",
+      data: result.rows[0], // Return the created conversation row
+    });
+  } catch (error) {
+    console.error("Error creating conversation:", error);
+    res.status(500).json({ message: "Database error", error });
+  }
+});
+
+const createOrUpdateRecipe = async (
+  userPrompt,
+  cuisineData,
+  dishName,
+  markdown
+) => {
+  try {
+    const { user_id, conversation_id } = userPrompt;
+
+    const existingRecipeResult = await pool.query(
+      "SELECT * FROM recipes WHERE user_id = $1 AND dish_name = $2",
+      [user_id, dishName]
+    );
+    if (existingRecipeResult.rows.length > 0) {
+      const existingRecipe = existingRecipeResult.rows[0];
+
+      const updateResult = await pool.query(
+        `UPDATE recipes
+        SET markdown = $1, cuisine_id = $2, created_at = CURRENT_TIMESTAMP
+        WHERE recipe_id = $3
+        RETURNING *`,
+        [markdown || null, cuisineData.cuisine_id, existingRecipe.recipe_id]
+      );
+
+      console.log("Updated recipe:", updateResult.rows[0]);
+      return updateResult.rows[0]; // Return the updated recipe row
+    }
+
+    // If the recipe does not exist, insert a new recipe
+    const insertResult = await pool.query(
+      `INSERT INTO recipes (user_id, og_conversation_id, dish_name, cuisine_id, markdown, created_at)
+          VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+          RETURNING *`,
+      [
+        user_id,
+        conversation_id,
+        dishName,
+        cuisineData.cuisine_id,
+        markdown || null,
+      ]
+    );
+
+    console.log("New recipe created:", insertResult.rows[0]);
+    return insertResult.rows[0];
+  } catch (error) {
+    console.error("Error creating or updating recipe:", error);
+    throw error;
+  }
+};
+
+const createOrGetCuisine = async (cuisine) => {
+  try {
+    if (cuisine) {
+      const result = await pool.query(
+        "SELECT * FROM cuisines WHERE cuisine_name = $1",
+        [cuisine]
+      );
+      if (result.rows.length > 0) {
+        console.log("Cuisine found:", result.rows[0]);
+        return result.rows[0];
+      }
+    } else {
+      // If the cuisine does not exist, insert a new row
+      const insertResult = await pool.query(
+        "INSERT INTO cuisines (cuisine_name) VALUES ($1) RETURNING *",
+        [cuisine]
+      );
+
+      return insertResult.rows[0];
+    }
+  } catch (error) {
+    console.error("Error checking or creating cuisine:", error);
+    throw error;
+  }
+};
+
+const storeChatLog = async (chatLog, role) => {
+  try {
+    const result = await pool.query(
+      "INSERT INTO chatlogs (role, content, created_at, conversation_id, user_id, message_type, markdown) VALUES ($1, $2, CURRENT_TIMESTAMP, $3, $4, $5, $6) RETURNING *",
+      [
+        chatLog.role,
+        chatLog.content,
+        chatLog.conversation_id,
+        chatLog.user_id,
+        chatLog.message_type,
+        chatLog.markdown || null, // If markdown exists, pass it; otherwise, pass null
+      ]
+    );
+
+    return result.rows[0];
+  } catch (error) {
+    console.error("Error storing chatlog:", error);
+    return false;
+  }
+};
 
 // Start Server
 const PORT = process.env.PORT || 3000;
