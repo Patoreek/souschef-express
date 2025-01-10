@@ -288,6 +288,74 @@ const storeChatLog = async (chatLog, role) => {
   }
 };
 
+const getRecipesData = async (userId) => {
+  if (!userId)
+    res.status(500).json({ message: "No ID passed into getRecipes Data." });
+  try {
+    const result = await pool.query(
+      `
+        WITH user_data AS (
+            SELECT 
+                u.user_id,
+                u.username,
+                u.email
+            FROM 
+                users u
+            WHERE 
+                u.user_id = $1
+        ),
+        cuisine_data AS (
+            SELECT 
+                c.cuisine_id,
+                c.cuisine_name,
+                c.cuisine_icon,
+                array_agg(json_build_object(
+                    'recipe_id', r.recipe_id,
+                    'dish_name', r.dish_name,
+                    'markdown', r.markdown,
+                    'created_at', r.created_at
+                )) AS recipes
+            FROM 
+                recipes r
+            JOIN 
+                cuisines c ON r.cuisine_id = c.cuisine_id
+            WHERE 
+                r.user_id = $1
+            GROUP BY 
+                c.cuisine_id, c.cuisine_name, c.cuisine_icon
+        )
+        SELECT 
+            (SELECT json_build_object(
+                'user_id', ud.user_id,
+                'username', ud.username,
+                'email', ud.email
+            ) FROM user_data ud) AS user,
+            (SELECT json_agg(cd) FROM cuisine_data cd) AS cuisines;
+    `,
+      [userId]
+    );
+    console.log(result.rows);
+    return result.rows;
+  } catch (error) {
+    console.error("Error grabbing recipes data:", error);
+    res.status(500).json({ message: "Error grabbing recipes data", error });
+    return false;
+  }
+};
+
+app.get("/get-sidebar-data", async (req, res) => {
+  console.log("getting sidebar data...");
+  const userId = 1;
+  const result = await getRecipesData(userId);
+  console.log("result: ", result);
+  if (result) {
+    res.status(201).json({
+      message: "Sidebar data grabbed successfully!",
+      data: result, // Return the created conversation row
+    });
+  }
+});
+
 // Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
