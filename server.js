@@ -126,6 +126,7 @@ app.post("/ask-chef", async (req, res) => {
     dishName: dishName,
     cuisine: cuisineData.id,
     recipe: recipeData.id,
+    markdown: markdown,
     conversation_id: userPrompt.conversation_id,
     user_id: 1,
     message_type: "text",
